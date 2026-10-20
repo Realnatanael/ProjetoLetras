@@ -4,6 +4,7 @@ import { translateTimedLines } from "./translate.js";
 
 const MODES = new Set(["original", "translation", "both"]);
 const MISS_TTL = 1000 * 60 * 60 * 12;
+const TRANSLATE_RETRY_MS = 1000 * 60 * 10;
 const defaults = () => ({
   songs: {},
   offsets: {},
@@ -81,6 +82,11 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => ports.delete(port));
 });
 
+function looksLikeFailedTranslation(lines) {
+  if (!Array.isArray(lines) || !lines.length) return false;
+  return lines.some((line) => /MYMEMORY WARNING|YOU USED ALL AVAILABLE FREE TRANSLATIONS/i.test(line?.text || ""));
+}
+
 function sanitize(value) {
   const next = { ...defaults(), ...(value || {}) };
   next.songs = next.songs && typeof next.songs === "object" ? next.songs : {};
@@ -89,6 +95,9 @@ function sanitize(value) {
   next.hidden = Boolean(next.hidden);
   next.autoFetch = next.autoFetch !== false;
   next.autoTranslate = next.autoTranslate !== false;
+  for (const song of Object.values(next.songs)) {
+    if (looksLikeFailedTranslation(song.translation)) song.translation = [];
+  }
   return next;
 }
 
@@ -128,6 +137,9 @@ function needsTranslation(song) {
   if (!song?.original?.length) return false;
   if (song.translation?.length) return false;
   if (song.source === "manual") return false;
+  if (song.translationErrorAt && Date.now() - Number(song.translationErrorAt) < TRANSLATE_RETRY_MS) {
+    return false;
+  }
   return true;
 }
 
@@ -145,7 +157,12 @@ async function maybeFetch({ force = false } = {}) {
 
   const song = library.songs[key];
   const wantOriginal = force || needsOriginal(song);
-  const wantTranslation = force ? library.autoTranslate && !(song?.translation?.length) : needsTranslation(song);
+  if (force && song?.translationErrorAt) {
+    library.songs[key] = { ...song, translationErrorAt: 0, translationError: "" };
+  }
+  const wantTranslation = force
+    ? library.autoTranslate && !(library.songs[key]?.translation?.length)
+    : needsTranslation(library.songs[key] || song);
 
   if (!wantOriginal && !wantTranslation) return null;
   if (inflight.has(key)) return inflight.get(key);
@@ -207,10 +224,18 @@ async function maybeFetch({ force = false } = {}) {
             ...current,
             translation: translated,
             translatedAt: Date.now(),
+            translationErrorAt: 0,
+            translationError: "",
           };
           await persist();
           setFetchStatus(key, "found", "Letra e tradução prontas.");
         } catch (error) {
+          library.songs[key] = {
+            ...current,
+            translationErrorAt: Date.now(),
+            translationError: error.message || "Tradução indisponível agora.",
+          };
+          await persist();
           setFetchStatus(key, "found", error.message || "Letra ok; tradução indisponível agora.");
         }
       }
