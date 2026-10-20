@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <title>Projeto Letras</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <p class="mark">Projeto Letras</p>
+      <h1 id="status">Procurando o Apple Music</h1>
+      <p id="clock">A aba music.apple.com precisa estar tocando.</p>
+    </header>
+
+    <section class="card">
+      <label class="check">
+        <input id="auto-fetch" type="checkbox" checked />
+        Buscar letra automaticamente (LRCLIB)
+      </label>
+      <label class="check">
+        <input id="auto-translate" type="checkbox" checked />
+        Traduzir automaticamente para português
+      </label>
+      <button id="fetch-now" type="button">Buscar esta faixa agora</button>
+      <p id="fetch-detail" role="status"></p>
+    </section>
+
+    <section class="card">
+      <label>
+        Artista
+        <input id="artist" type="text" autocomplete="off" />
+      </label>
+      <label>
+        Música
+        <input id="title" type="text" autocomplete="off" />
+      </label>
+      <div class="row">
+        <button id="import-original" type="button" class="ghost">Importar original</button>
+        <button id="import-translation" type="button" class="ghost">Importar tradução</button>
+      </div>
+      <input id="file" type="file" accept=".lrc,.txt,text/plain" hidden />
+      <details>
+        <summary>Colar a letra (reserva)</summary>
+        <textarea id="paste" rows="6" placeholder="[00:12.50] primeira linha"></textarea>
+        <div class="row">
+          <button id="paste-original" type="button" class="ghost">Salvar original</button>
+          <button id="paste-translation" type="button" class="ghost">Salvar tradução</button>
+        </div>
+      </details>
+      <label class="offset">
+        Ajuste do tempo
+        <input id="offset" type="number" min="-30" max="30" step="0.1" value="0" />
+      </label>
+      <p id="message" role="status"></p>
+    </section>
+
+    <section>
+      <h2>Letras salvas</h2>
+      <ul id="songs"></ul>
+    </section>
+
+    <details id="help">
+      <summary>Como usar</summary>
+      <ol>
+        <li>No Chrome ou Edge, abra as extensões e ligue o modo de desenvolvedor.</li>
+        <li>Escolha carregar sem compactação e aponte para esta pasta.</li>
+        <li>Deixe o Apple Music tocando numa aba e o YouTube mudo na outra.</li>
+        <li>A letra vem da LRCLIB; a tradução é automática e pode falhar em algumas faixas.</li>
+      </ol>
+    </details>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
