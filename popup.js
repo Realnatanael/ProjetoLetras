@@ -169,6 +169,7 @@ function renderSongs(list) {
     const parts = [item.artist];
     if (item.original) parts.push(`${item.original} originais`);
     if (item.translation) parts.push(`${item.translation} traduzidas`);
+    if (item.status === "plain") parts.push("sem sincronia");
     if (item.source === "lrclib") parts.push("LRCLIB");
     if (item.source === "manual") parts.push("manual");
     meta.textContent = parts.join(" · ");
@@ -207,7 +208,7 @@ async function refresh() {
   state = await chrome.runtime.sendMessage({ type: "get-state" });
   if (!state) return;
   const playback = state.playback;
-  const fresh = playback && Date.now() - playback.at < 4000;
+  const fresh = playbackFresh(playback);
 
   if (!fresh) {
     statusTitle.textContent = "Apple Music não detectado";
@@ -215,7 +216,7 @@ async function refresh() {
   } else {
     statusTitle.textContent = playback.title;
     const duration = playback.duration ? ` / ${format(playback.duration)}` : "";
-    clock.textContent = `${playback.artist || "Artista desconhecido"} · ${playback.playing ? "tocando" : "pausado"} · ${format(playback.time)}${duration}`;
+    clock.textContent = `${playback.artist || "Artista desconhecido"} · ${playback.playing ? "tocando" : "pausado"} · ${format(shownTime(playback))}${duration}`;
     if (!fieldsDirty && document.activeElement !== artistInput && document.activeElement !== titleInput) {
       artistInput.value = playback.artist || "";
       titleInput.value = playback.title || "";
@@ -229,12 +230,29 @@ async function refresh() {
   renderSongs(state.songs || []);
 }
 
+function playbackFresh(playback) {
+  if (!playback?.title) return false;
+  const age = (Date.now() - Number(playback.at || 0)) / 1000;
+  if (age < 4) return true;
+  return Boolean(playback.playing) && age < 45 * 60;
+}
+
+function shownTime(playback) {
+  let time = Number(playback.time) || 0;
+  const at = Number(playback.at) || 0;
+  if (playback.playing && at > 0) {
+    const elapsed = (Date.now() - at) / 1000;
+    if (elapsed > 0) time += Math.min(elapsed, 45 * 60);
+  }
+  if (playback.duration > 0) time = Math.min(time, playback.duration);
+  return time;
+}
+
 function paintClock() {
   const playback = state?.playback;
-  if (playback && Date.now() - playback.at < 4000) {
-    const elapsed = playback.playing ? Math.min(3, Math.max(0, (Date.now() - playback.at) / 1000)) : 0;
+  if (playbackFresh(playback)) {
     const duration = playback.duration ? ` / ${format(playback.duration)}` : "";
-    clock.textContent = `${playback.artist || "Artista desconhecido"} · ${playback.playing ? "tocando" : "pausado"} · ${format(playback.time + elapsed)}${duration}`;
+    clock.textContent = `${playback.artist || "Artista desconhecido"} · ${playback.playing ? "tocando" : "pausado"} · ${format(shownTime(playback))}${duration}`;
   }
   window.requestAnimationFrame(paintClock);
 }

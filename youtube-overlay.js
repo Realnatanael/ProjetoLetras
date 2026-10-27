@@ -8,17 +8,25 @@
 
   const wrapper = document.createElement("div");
   wrapper.innerHTML = `
-    <div id="pl-root">
+    <div id="pl-root" data-sync="line">
       <div id="pl-stage"><div id="pl-lines"></div></div>
       <p id="pl-hint" hidden></p>
+      <p id="pl-sync" hidden>Letra sem tempo sincronizado</p>
       <div id="pl-hud">
-        <button type="button" data-mode="original">Original</button>
-        <button type="button" data-mode="translation">Tradução</button>
-        <button type="button" data-mode="both">As duas</button>
-        <button type="button" data-offset="-0.1" title="Atrasar a letra">−</button>
-        <span id="pl-offset">0,0s</span>
-        <button type="button" data-offset="0.1" title="Adiantar a letra">+</button>
-        <button type="button" id="pl-hide">Ocultar</button>
+        <div id="pl-bar">
+          <button type="button" data-mode="original">Original</button>
+          <button type="button" data-mode="translation">Tradução</button>
+          <button type="button" data-mode="both">As duas</button>
+          <button type="button" data-offset="-0.1" title="Atrasar a letra">−</button>
+          <span id="pl-offset">0,0s</span>
+          <button type="button" data-offset="0.1" title="Adiantar a letra">+</button>
+          <button type="button" id="pl-hide">Ocultar</button>
+          <button type="button" id="pl-reject">Não é essa</button>
+        </div>
+        <div id="pl-pick" hidden>
+          <p id="pl-pick-label">Qual é a letra certa?</p>
+          <div id="pl-options"></div>
+        </div>
       </div>
     </div>
   `;
@@ -30,6 +38,11 @@
   const hintEl = shadow.getElementById("pl-hint");
   const offsetEl = shadow.getElementById("pl-offset");
   const hideButton = shadow.getElementById("pl-hide");
+  const syncEl = shadow.getElementById("pl-sync");
+  const rejectButton = shadow.getElementById("pl-reject");
+  const pickEl = shadow.getElementById("pl-pick");
+  const pickLabel = shadow.getElementById("pl-pick-label");
+  const optionsEl = shadow.getElementById("pl-options");
   const modeButtons = [...shadow.querySelectorAll("[data-mode]")];
 
   let playback = null;
@@ -37,6 +50,8 @@
   let offset = 0;
   let mode = "original";
   let hidden = false;
+  let synced = true;
+  let pickOpen = false;
   let matched = false;
   let fetchStatus = { state: "idle", detail: "" };
   let key = "";
@@ -65,22 +80,39 @@
     return index;
   }
 
+  const MAX_EXTRAPOLATE = 45 * 60;
+
+  function trackTime() {
+    if (!playback) return 0;
+    let target = Number(playback.time) || 0;
+    const at = Number(playback.at) || 0;
+    if (playback.playing && at > 0) {
+      const elapsed = (Date.now() - at) / 1000;
+      if (elapsed > 0) target += Math.min(elapsed, MAX_EXTRAPOLATE);
+    }
+    const duration = Number(playback.duration) || 0;
+    if (duration > 0) target = Math.min(target, Math.max(duration - 0.05, 0));
+    return Math.max(0, target);
+  }
+
   function displayedTime() {
     if (!playback) return smoothTime;
-    let target = Number(playback.time) || 0;
-    if (playback.playing) {
-      const elapsed = (Date.now() - playback.at) / 1000;
-      if (elapsed >= 0 && elapsed < 3) target += elapsed;
-    }
-    target += offset;
+    const target = trackTime() + offset;
     const gap = target - smoothTime;
     if (!playback.playing || Math.abs(gap) > 0.45) smoothTime = target;
     else smoothTime += gap * 0.35;
     return smoothTime;
   }
 
+  function plainIndex(lines) {
+    const duration = Number(playback?.duration) || 0;
+    if (duration <= 0 || !lines.length) return 0;
+    const ratio = Math.min(0.999, Math.max(0, trackTime() / duration));
+    return Math.min(lines.length - 1, Math.floor(ratio * lines.length));
+  }
+
   function rebuild(lines) {
-    const signature = `${key}|${mode}|${lines.map((line) => `${line.t}|${line.text}`).join("\n")}`;
+    const signature = `${key}|${mode}|${synced ? "s" : "p"}|${lines.map((line) => `${line.t}|${line.text}`).join("\n")}`;
     if (signature === builtKey) return false;
     builtKey = signature;
     activeIndex = -1;
@@ -134,10 +166,11 @@
     scrollRaf = requestAnimationFrame(run);
   }
 
-  function subtitle(time) {
+  function subtitle(time, index) {
     if (mode !== "both" || !lyrics.translation.length || !lyrics.original.length) return "";
-    const index = lineIndex(lyrics.translation, time);
-    return index >= 0 ? lyrics.translation[index].text : "";
+    if (!synced) return lyrics.translation[index]?.text || "";
+    const found = lineIndex(lyrics.translation, time);
+    return found >= 0 ? lyrics.translation[found].text : "";
   }
 
   function clearLines() {
@@ -191,6 +224,9 @@
     hideButton.textContent = hidden ? "Mostrar" : "Ocultar";
     offsetEl.textContent = `${offset > 0 ? "+" : ""}${offset.toFixed(1).replace(".", ",")}s`;
 
+    root.dataset.sync = synced ? "line" : "plain";
+    rejectButton.setAttribute("aria-expanded", pickOpen ? "true" : "false");
+
     for (const button of modeButtons) {
       const needsTranslation = button.dataset.mode !== "original";
       button.disabled = needsTranslation && lyrics.translation.length === 0;
@@ -199,11 +235,13 @@
 
     if (!playback?.title) {
       clearLines();
+      syncEl.hidden = true;
       showHint("Abra o Apple Music em outra aba e dê play. Deixe este vídeo mudo.");
       return;
     }
     if (lines.length === 0) {
       clearLines();
+      syncEl.hidden = true;
       const label = playback.artist ? `${playback.artist} — ${playback.title}` : playback.title;
       if (fetchStatus.state === "fetching") showHint(`Buscando letra de ${label}…`);
       else if (fetchStatus.state === "translating") showHint("Traduzindo a letra…");
@@ -218,13 +256,19 @@
     }
 
     hintEl.hidden = true;
+    syncEl.hidden = hidden || synced;
+    if (!synced) {
+      syncEl.textContent = Number(playback.duration) > 0
+        ? "Letra sem tempo sincronizado. O texto acompanha a duração da faixa."
+        : "Letra sem tempo sincronizado.";
+    }
     const time = displayedTime();
     const rebuilt = rebuild(lines);
     if (!stage?.clientHeight) return;
 
-    const index = Math.max(0, lineIndex(lines, time));
+    const index = synced ? Math.max(0, lineIndex(lines, time)) : plainIndex(lines);
     const changed = index !== activeIndex;
-    updateLineStates(index, subtitle(time), changed);
+    updateLineStates(index, subtitle(time, index), changed);
 
     if (rebuilt) {
       activeIndex = index;
@@ -288,12 +332,99 @@
   }
 
   function hideHudSoon() {
+    if (pickOpen) return;
     window.clearTimeout(hudTimer);
     hudTimer = window.setTimeout(() => {
       hudVisible = false;
       root.dataset.hud = "false";
     }, 700);
   }
+
+  function closePick() {
+    pickOpen = false;
+    pickEl.hidden = true;
+    rejectButton.setAttribute("aria-expanded", "false");
+  }
+
+  function formatDuration(seconds) {
+    const safe = Math.round(Number(seconds) || 0);
+    if (!safe) return "";
+    return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, "0")}`;
+  }
+
+  function renderCandidates(list, error) {
+    optionsEl.replaceChildren();
+    pickLabel.textContent = "Qual é a letra certa?";
+    if (error) {
+      optionsEl.textContent = error;
+      return;
+    }
+    if (!list.length || list.every((item) => item.current)) {
+      optionsEl.textContent = "A LRCLIB não tem outra versão parecida.";
+      return;
+    }
+
+    for (const item of list) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "pl-option";
+      const title = [item.artist, item.title].filter(Boolean).join(" — ");
+      const meta = [];
+      if (item.album) meta.push(item.album);
+      const duration = formatDuration(item.duration);
+      if (duration) meta.push(duration);
+      if (item.instrumental) meta.push("instrumental");
+      else meta.push(item.synced ? "sincronizada" : "sem tempo");
+      if (item.current) meta.push("em uso");
+      button.textContent = meta.length ? `${title} · ${meta.join(" · ")}` : title;
+      button.disabled = Boolean(item.current);
+      button.setAttribute("aria-current", item.current ? "true" : "false");
+      button.addEventListener("click", () => chooseCandidate(item.id));
+      optionsEl.appendChild(button);
+    }
+  }
+
+  async function chooseCandidate(id) {
+    optionsEl.textContent = "Trocando a letra…";
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "pick-candidate", id });
+      if (response?.ok === false) {
+        optionsEl.textContent = response.error || "Não consegui trocar a letra.";
+        return;
+      }
+      closePick();
+    } catch {
+      optionsEl.textContent = "Não consegui trocar a letra.";
+    }
+  }
+
+  async function togglePick() {
+    if (pickOpen) {
+      closePick();
+      return;
+    }
+    pickOpen = true;
+    pickEl.hidden = false;
+    showHud();
+    pickLabel.textContent = "Qual é a letra certa?";
+    optionsEl.textContent = "Buscando outras versões…";
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "list-candidates" });
+      renderCandidates(response?.candidates || [], response?.ok === false ? response.error : "");
+    } catch {
+      renderCandidates([], "Não consegui consultar a LRCLIB.");
+    }
+  }
+
+  rejectButton.addEventListener("click", () => {
+    void togglePick();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !pickOpen) return;
+    event.stopPropagation();
+    closePick();
+  }, true);
 
   function onMouseMove(event) {
     if (host.hidden) return;
@@ -310,6 +441,7 @@
     if (nextKey !== key) {
       smoothTime = Number(message.playback?.time) || 0;
       activeIndex = -1;
+      closePick();
     }
     playback = message.playback;
     key = nextKey;
@@ -317,6 +449,7 @@
     mode = message.mode || "original";
     hidden = Boolean(message.hidden);
     matched = Boolean(message.matched);
+    if (typeof message.synced === "boolean") synced = message.synced;
     fetchStatus = message.fetchStatus || { state: "idle", detail: "" };
     if (message.lyrics) lyrics = message.lyrics;
   }
@@ -351,4 +484,3 @@
   }
   tick();
 })();
-// O código inteiro é encapsulado em uma IIFE (Immediately Invoked Function Expression) para evitar poluição do escopo global. Ele cria uma sobreposição de letras para vídeos do YouTube, permitindo que os usuários vejam letras originais, traduções ou ambas, com opções de ajuste de tempo e visibilidade. A sobreposição é atualizada dinamicamente com base no estado da reprodução e nas interações do usuário.

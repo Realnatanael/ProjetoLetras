@@ -124,6 +124,12 @@
     }
   }
 
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin || event.source !== window) return;
+    if (event.data?.source !== "projeto-letras-host" || event.data.type !== "ping") return;
+    publish();
+  });
+
   window.setInterval(() => {
     listen();
     publish();

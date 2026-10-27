@@ -1,5 +1,5 @@
 import { songKey } from "./library.js";
-import { fetchLyrics } from "./lrclib.js";
+import { fetchLyrics, fetchLyricsById, findCandidates } from "./lrclib.js";
 import { translateTimedLines } from "./translate.js";
 
 const MODES = new Set(["original", "translation", "both"]);
@@ -16,10 +16,13 @@ const defaults = () => ({
 
 let library = defaults();
 let playback = null;
+let playbackTabId = 0;
 let revision = 0;
 let fetchStatus = { key: "", state: "idle", detail: "" };
 const ports = new Set();
+const playbackPorts = new Set();
 const inflight = new Map();
+let pingTimer = 0;
 
 const ready = chrome.storage.local.get("library").then((stored) => {
   library = sanitize(stored.library);
@@ -32,9 +35,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
   broadcast(true);
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "playback") {
-    playback = message.payload || null;
+    acceptPlayback(message.payload || null, sender.tab?.id || 0);
     void ready.then(() => {
       broadcast(false);
       void maybeFetch();
@@ -67,9 +70,35 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     });
     return true;
   }
+
+  if (message?.type === "list-candidates") {
+    void ready.then(async () => {
+      try {
+        sendResponse({ ok: true, candidates: await listCandidates() });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message || "Não consegui consultar a LRCLIB.", candidates: [] });
+      }
+    });
+    return true;
+  }
+
+  if (message?.type === "pick-candidate") {
+    void ready.then(async () => {
+      try {
+        sendResponse(await applyCandidate(message.id));
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message || "Não consegui trocar a letra." });
+      }
+    });
+    return true;
+  }
 });
 
 chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === "playback") {
+    watchPlaybackPort(port);
+    return;
+  }
   if (port.name !== "overlay") return;
   ports.add(port);
   void ready.then(() => {
@@ -81,6 +110,63 @@ chrome.runtime.onConnect.addListener((port) => {
   });
   port.onDisconnect.addListener(() => ports.delete(port));
 });
+
+function watchPlaybackPort(port) {
+  playbackPorts.add(port);
+  const tabId = port.sender?.tab?.id || 0;
+  try {
+    port.postMessage({ type: "ping" });
+  } catch {
+    playbackPorts.delete(port);
+  }
+  port.onDisconnect.addListener(() => {
+    playbackPorts.delete(port);
+    if (!tabId || tabId !== playbackTabId) return;
+    setTimeout(() => {
+      const stillThere = [...playbackPorts].some((item) => item.sender?.tab?.id === tabId);
+      if (!stillThere && playbackTabId === tabId) {
+        playback = null;
+        playbackTabId = 0;
+        broadcast(false);
+      }
+    }, 1500);
+  });
+  ensureClock();
+}
+
+function ensureClock() {
+  if (pingTimer) return;
+  pingTimer = setInterval(() => {
+    if (!playbackPorts.size) {
+      clearInterval(pingTimer);
+      pingTimer = 0;
+      return;
+    }
+    for (const port of playbackPorts) {
+      try {
+        port.postMessage({ type: "ping" });
+      } catch {
+        playbackPorts.delete(port);
+      }
+    }
+  }, 1000);
+}
+
+function acceptPlayback(incoming, fromTab) {
+  if (!incoming?.title) {
+    if (!fromTab || fromTab === playbackTabId) {
+      playback = null;
+      playbackTabId = 0;
+    }
+    return;
+  }
+
+  const fresh = playback && Date.now() - Number(playback.at) < 5000;
+  if (fresh && playback.playing && playbackTabId && fromTab && fromTab !== playbackTabId && !incoming.playing) return;
+
+  playback = incoming;
+  if (fromTab) playbackTabId = fromTab;
+}
 
 function looksLikeFailedTranslation(lines) {
   if (!Array.isArray(lines) || !lines.length) return false;
@@ -122,9 +208,19 @@ function setFetchStatus(key, state, detail = "") {
   broadcast(false);
 }
 
+function isSynced(song) {
+  if (!song?.original?.length) return false;
+  if (song.synced === false || song.status === "plain") return false;
+  return true;
+}
+
 function needsOriginal(song) {
   if (!song) return true;
+  if (song.picked) return false;
   if (song.source === "manual" && song.original?.length) return false;
+  if (song.status === "plain" && song.original?.length) {
+    return Date.now() - Number(song.fetchedAt || 0) > MISS_TTL;
+  }
   if (song.original?.length) return false;
   if (song.status === "missing" || song.status === "instrumental") {
     return Date.now() - Number(song.fetchedAt || 0) > MISS_TTL;
@@ -137,6 +233,7 @@ function needsTranslation(song) {
   if (!song?.original?.length) return false;
   if (song.translation?.length) return false;
   if (song.source === "manual") return false;
+  if (song.translationSkipped === "pt") return false;
   if (song.translationErrorAt && Date.now() - Number(song.translationErrorAt) < TRANSLATE_RETRY_MS) {
     return false;
   }
@@ -149,6 +246,132 @@ async function persist() {
   broadcast(true);
 }
 
+function foundDetail(result) {
+  if (result.status === "plain") return "Letra encontrada, sem tempo sincronizado.";
+  return `${result.lines.length} linhas encontradas.`;
+}
+
+function rememberLyrics(key, result, picked) {
+  const previous = library.songs[key] || {
+    artist: playback?.artist || "",
+    title: playback?.title || "",
+    album: playback?.album || "",
+    original: [],
+    translation: [],
+  };
+  library.songs[key] = {
+    ...previous,
+    artist: playback?.artist || previous.artist || "",
+    title: playback?.title || previous.title || "",
+    album: playback?.album || previous.album || "",
+    source: "lrclib",
+    status: result.status,
+    synced: Boolean(result.synced),
+    lrclibId: Number(result.record?.id) || 0,
+    fetchedAt: Date.now(),
+    original: result.lines,
+    translation: [],
+    translationSkipped: "",
+    translationError: "",
+    translationErrorAt: 0,
+    picked: Boolean(picked),
+  };
+}
+
+async function fillTranslation(key) {
+  const current = library.songs[key];
+  if (!needsTranslation(current)) return;
+
+  setFetchStatus(key, "translating", "Traduzindo para português…");
+  try {
+    const translated = await translateTimedLines(current.original);
+    const latest = library.songs[key] || current;
+    library.songs[key] = {
+      ...latest,
+      translation: translated,
+      translatedAt: Date.now(),
+      translationErrorAt: 0,
+      translationError: "",
+      translationSkipped: "",
+    };
+    await persist();
+    const unsynced = latest.status === "plain" || latest.synced === false;
+    setFetchStatus(key, "found", unsynced ? "Letra sem sincronia. Tradução pronta." : "Letra e tradução prontas.");
+  } catch (error) {
+    const latest = library.songs[key] || current;
+    if (error.code === "already_pt") {
+      library.songs[key] = {
+        ...latest,
+        translation: [],
+        translationSkipped: "pt",
+        translationErrorAt: 0,
+        translationError: "",
+      };
+      await persist();
+      setFetchStatus(key, "found", "A letra já está em português.");
+      return;
+    }
+    library.songs[key] = {
+      ...latest,
+      translationErrorAt: Date.now(),
+      translationError: error.message || "Tradução indisponível agora.",
+    };
+    await persist();
+    setFetchStatus(key, "found", error.message || "Letra ok; tradução indisponível agora.");
+  }
+}
+
+function enqueue(key, task) {
+  const previous = inflight.get(key) || Promise.resolve();
+  const job = previous.then(task, task);
+  const settled = job.then(
+    () => undefined,
+    () => undefined,
+  );
+  inflight.set(key, settled);
+  settled.then(() => {
+    if (inflight.get(key) === settled) inflight.delete(key);
+  });
+  return job;
+}
+
+async function fetchSong(key, force) {
+  if (currentKey() !== key || !playback?.title) return view();
+  const song = library.songs[key];
+  const wantOriginal = force || needsOriginal(song);
+  if (!wantOriginal && !needsTranslation(song)) return view();
+
+  try {
+    if (wantOriginal) {
+      setFetchStatus(key, "fetching", "Buscando letra na LRCLIB…");
+      const result = await fetchLyrics({
+        artist: playback.artist,
+        title: playback.title,
+        album: playback.album,
+        duration: playback.duration,
+      });
+      const failed = result.status === "missing" || result.status === "instrumental" || result.status === "invalid";
+      rememberLyrics(key, result, false);
+      await persist();
+      if (failed) {
+        setFetchStatus(
+          key,
+          result.status,
+          result.status === "instrumental" ? "Faixa instrumental." : "LRCLIB não encontrou essa letra.",
+        );
+        return view();
+      }
+      setFetchStatus(key, "found", foundDetail(result));
+    }
+
+    await fillTranslation(key);
+    return view();
+  } catch (error) {
+    setFetchStatus(key, "error", error.message || "Falha ao buscar a letra.");
+    return view();
+  }
+}
+
 async function maybeFetch({ force = false } = {}) {
   await ready;
   const key = currentKey();
@@ -156,101 +379,59 @@ async function maybeFetch({ force = false } = {}) {
   if (!force && !library.autoFetch) return null;
 
   const song = library.songs[key];
-  const wantOriginal = force || needsOriginal(song);
-  if (force && song?.translationErrorAt) {
-    library.songs[key] = { ...song, translationErrorAt: 0, translationError: "" };
-  }
-  const wantTranslation = force
-    ? library.autoTranslate && !(library.songs[key]?.translation?.length)
-    : needsTranslation(library.songs[key] || song);
+  if (!force && !needsOriginal(song) && !needsTranslation(song)) return null;
+  if (inflight.has(key) && !force) return inflight.get(key);
+  return enqueue(key, () => fetchSong(key, force));
+}
 
-  if (!wantOriginal && !wantTranslation) return null;
-  if (inflight.has(key)) return inflight.get(key);
+async function listCandidates() {
+  const key = currentKey();
+  if (!key || !playback?.title) throw new Error("Abra o Apple Music e dê play.");
+  const found = await findCandidates({
+    artist: playback.artist,
+    title: playback.title,
+    duration: playback.duration,
+  });
+  const currentId = Number(library.songs[key]?.lrclibId) || 0;
+  const current = found.find((item) => item.id === currentId);
+  const others = found.filter((item) => item.id !== currentId).slice(0, 3);
+  const list = others.map((item) => ({ ...item, current: false }));
+  if (current) list.unshift({ ...current, current: true });
+  return list;
+}
 
-  const job = (async () => {
-    try {
-      let current = library.songs[key] || {
-        artist: playback.artist || "",
-        title: playback.title || "",
-        album: playback.album || "",
-        original: [],
-        translation: [],
-        source: "lrclib",
-      };
-
-      if (wantOriginal) {
-        setFetchStatus(key, "fetching", "Buscando letra na LRCLIB…");
-        const result = await fetchLyrics({
-          artist: playback.artist,
-          title: playback.title,
-          album: playback.album,
-          duration: playback.duration,
-        });
-
-        current = {
-          ...current,
-          artist: playback.artist || current.artist || "",
-          title: playback.title || current.title || "",
-          album: playback.album || current.album || "",
-          source: "lrclib",
-          status: result.status,
-          fetchedAt: Date.now(),
-          original: result.lines,
-        };
-
-        if (result.status === "missing" || result.status === "instrumental" || result.status === "invalid") {
-          current.translation = [];
-          library.songs[key] = current;
-          await persist();
-          setFetchStatus(
-            key,
-            result.status,
-            result.status === "instrumental" ? "Faixa instrumental." : "LRCLIB não encontrou essa letra.",
-          );
-          return view();
-        }
-
-        library.songs[key] = current;
-        await persist();
-        setFetchStatus(key, "found", `${result.lines.length} linhas encontradas.`);
-      }
-
-      current = library.songs[key];
-      if (library.autoTranslate && current?.original?.length && !current.translation?.length) {
-        setFetchStatus(key, "translating", "Traduzindo para português…");
-        try {
-          const translated = await translateTimedLines(current.original);
-          library.songs[key] = {
-            ...current,
-            translation: translated,
-            translatedAt: Date.now(),
-            translationErrorAt: 0,
-            translationError: "",
-          };
-          await persist();
-          setFetchStatus(key, "found", "Letra e tradução prontas.");
-        } catch (error) {
-          library.songs[key] = {
-            ...current,
-            translationErrorAt: Date.now(),
-            translationError: error.message || "Tradução indisponível agora.",
-          };
-          await persist();
-          setFetchStatus(key, "found", error.message || "Letra ok; tradução indisponível agora.");
-        }
-      }
-
+async function pickSong(key, id) {
+  if (currentKey() !== key || !playback?.title) throw new Error("A faixa mudou.");
+  setFetchStatus(key, "fetching", "Trocando a letra…");
+  try {
+    const result = await fetchLyricsById(id);
+    const failed = result.status === "missing" || result.status === "instrumental" || result.status === "invalid";
+    rememberLyrics(key, result, true);
+    await persist();
+    if (failed) {
+      setFetchStatus(
+        key,
+        result.status === "instrumental" ? "instrumental" : "missing",
+        result.status === "instrumental" ? "Faixa instrumental." : "Essa versão não tem letra.",
+      );
       return view();
-    } catch (error) {
-      setFetchStatus(key, "error", error.message || "Falha ao buscar a letra.");
-      return view();
-    } finally {
-      inflight.delete(key);
     }
-  })();
+    setFetchStatus(key, "found", result.synced ? "Letra trocada." : "Letra trocada. Esta versão não tem tempo.");
+    await fillTranslation(key);
+    return view();
+  } catch (error) {
+    setFetchStatus(key, "error", error.message || "Não consegui trocar a letra.");
+    throw error;
+  }
+}
 
-  inflight.set(key, job);
-  return job;
+async function applyCandidate(id) {
+  await ready;
+  const key = currentKey();
+  if (!key || !playback?.title) throw new Error("Abra o Apple Music e dê play.");
+  const numeric = Number(id);
+  if (!Number.isFinite(numeric) || numeric <= 0) throw new Error("Escolha uma versão.");
+  return enqueue(key, () => pickSong(key, numeric));
 }
 
 function messageFor(port, forceLyrics) {
@@ -269,6 +450,7 @@ function messageFor(port, forceLyrics) {
     hidden: library.hidden,
     autoFetch: library.autoFetch,
     autoTranslate: library.autoTranslate,
+    synced: isSynced(song),
     fetchStatus: fetchStatus.key === key ? fetchStatus : { key, state: "idle", detail: "" },
     matched: Boolean(song && (song.original?.length || song.translation?.length)),
   };
