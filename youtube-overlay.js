@@ -351,3 +351,4 @@
   }
   tick();
 })();
+// O código inteiro é encapsulado em uma IIFE (Immediately Invoked Function Expression) para evitar poluição do escopo global. Ele cria uma sobreposição de letras para vídeos do YouTube, permitindo que os usuários vejam letras originais, traduções ou ambas, com opções de ajuste de tempo e visibilidade. A sobreposição é atualizada dinamicamente com base no estado da reprodução e nas interações do usuário.
