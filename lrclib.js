@@ -1,8 +1,19 @@
 import { normalize, parseLrc } from "./library.js";
 
-const CLIENT = "ProjetoLetras v1.3.0 (local personal use)";
-const BASE = "https://lrclib.net/api";
+const CLIENT = "ProjetoLetras v1.3.1 (local personal use)";
+const HOSTS = [
+  { name: "lrclib", base: "https://lrclib.net/api" },
+  { name: "lrcmux", base: "https://api.lrcmux.dev/compat/lrclib/api" },
+];
+const TRANSIENT = new Set([502, 503, 504]);
+const RETRIES = 2;
+const BACKOFF_MS = 400;
+const HOST_COOLDOWN_MS = 45 * 1000;
 const EDITION_RE = /\b(remix|live|acoustic|ac[uú]stic[oa]|radio edit|slowed|sped up|karaoke|cover)\b/gi;
+
+const hostSkipUntil = new Map();
+const recentRecords = new Map();
+let activeHost = HOSTS[0];
 
 function headers() {
   return {
@@ -10,6 +21,10 @@ function headers() {
     "Lrclib-Client": CLIENT,
     "X-User-Agent": CLIENT,
   };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function query(params) {
@@ -21,22 +36,82 @@ function query(params) {
   return search.toString();
 }
 
-async function request(path) {
-  const response = await fetch(`${BASE}${path}`, { headers: headers() });
-  if (response.status === 404) return null;
-  if (response.status === 429) {
-    const wait = Number(response.headers.get("Retry-After") || 5);
-    const error = new Error(`LRCLIB limitou as buscas. Tente de novo em ${wait}s.`);
-    error.code = "rate_limit";
-    error.retryAfter = wait;
-    throw error;
+function gatewayError(status) {
+  const error = new Error(`A busca de letra está fora agora (${status}). Tente de novo em alguns segundos.`);
+  error.code = "gateway";
+  error.status = status;
+  return error;
+}
+
+function readyHosts() {
+  const now = Date.now();
+  const ready = HOSTS.filter((host) => now >= (hostSkipUntil.get(host.name) || 0));
+  return ready.length ? ready : HOSTS;
+}
+
+function recordId(record) {
+  const id = Number(record?.id);
+  if (Number.isFinite(id) && id > 0) return id;
+  const key = [
+    normalize(record?.artistName),
+    normalize(record?.trackName),
+    normalize(record?.albumName),
+    Number(record?.duration) || 0,
+  ].join("|");
+  let hash = 0;
+  for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return -Math.max(1, hash % 1_000_000_000);
+}
+
+function rememberRecord(record) {
+  if (!record) return 0;
+  const id = recordId(record);
+  recentRecords.set(id, record);
+  return id;
+}
+
+async function request(path, { optional = false } = {}) {
+  let lastError = null;
+
+  for (const host of readyHosts()) {
+    for (let attempt = 0; attempt < RETRIES; attempt += 1) {
+      try {
+        const response = await fetch(`${host.base}${path}`, { headers: headers() });
+        if (response.status === 404) {
+          hostSkipUntil.delete(host.name);
+          return null;
+        }
+        if (response.status === 429) {
+          const waitFor = Number(response.headers.get("Retry-After") || 5);
+          const error = new Error(`A busca de letra limitou as consultas. Tente de novo em ${waitFor}s.`);
+          error.code = "rate_limit";
+          error.retryAfter = waitFor;
+          throw error;
+        }
+        if (TRANSIENT.has(response.status)) {
+          lastError = gatewayError(response.status);
+          if (attempt + 1 < RETRIES) await wait(BACKOFF_MS * (attempt + 1));
+          continue;
+        }
+        if (!response.ok) {
+          const error = new Error(`A busca de letra respondeu ${response.status}.`);
+          error.code = "http";
+          throw error;
+        }
+        hostSkipUntil.delete(host.name);
+        activeHost = host;
+        return await response.json();
+      } catch (error) {
+        lastError = error;
+        if (error.code === "rate_limit" || error.code === "http") throw error;
+        if (attempt + 1 < RETRIES) await wait(BACKOFF_MS * (attempt + 1));
+      }
+    }
+    hostSkipUntil.set(host.name, Date.now() + HOST_COOLDOWN_MS);
   }
-  if (!response.ok) {
-    const error = new Error(`LRCLIB respondeu ${response.status}.`);
-    error.code = "http";
-    throw error;
-  }
-  return response.json();
+
+  if (optional) return null;
+  throw lastError || new Error("Nenhum serviço de letra respondeu.");
 }
 
 function canonEdition(tag) {
@@ -113,21 +188,22 @@ function linesFrom(record) {
 }
 
 function outcome(record) {
-  if (!record) return { status: "missing", lines: [], synced: false, record: null };
-  if (record.instrumental) return { status: "instrumental", lines: [], synced: false, record };
+  if (!record) return { status: "missing", lines: [], synced: false, record: null, provider: activeHost.name };
+  if (record.instrumental) return { status: "instrumental", lines: [], synced: false, record, provider: activeHost.name };
   const parsed = linesFrom(record);
-  if (!parsed.lines.length) return { status: "missing", lines: [], synced: false, record };
+  if (!parsed.lines.length) return { status: "missing", lines: [], synced: false, record, provider: activeHost.name };
   return {
     status: parsed.synced ? "synced" : "plain",
     lines: parsed.lines,
     synced: parsed.synced,
     record,
+    provider: activeHost.name,
   };
 }
 
 function summarize(record, artist, title, duration) {
   return {
-    id: Number(record.id) || 0,
+    id: rememberRecord(record),
     title: record.trackName || "",
     artist: record.artistName || "",
     album: record.albumName || "",
@@ -161,15 +237,26 @@ export async function findCandidates({ artist, title, duration, limit = 6 }) {
 
 export async function fetchLyricsById(id) {
   const numeric = Number(id);
-  if (!Number.isFinite(numeric) || numeric <= 0) return outcome(null);
-  return outcome(await request(`/get/${numeric}`));
+  if (!Number.isFinite(numeric) || numeric === 0) return outcome(null);
+  const cached = recentRecords.get(numeric);
+  if (numeric < 0) return outcome(cached || null);
+  try {
+    const record = await request(`/get/${numeric}`, { optional: true });
+    if (record) {
+      rememberRecord(record);
+      return outcome(record);
+    }
+  } catch {
+    // A LRCLIB pode estar fora; usa o resultado da busca recente.
+  }
+  return outcome(cached || null);
 }
 
 export async function fetchLyrics({ artist, title, album, duration }) {
   const trackName = String(title || "").trim();
   const artistName = String(artist || "").trim();
   if (!trackName || !artistName) {
-    return { status: "invalid", lines: [], synced: false, record: null };
+    return { status: "invalid", lines: [], synced: false, record: null, provider: activeHost.name };
   }
 
   const rounded = duration > 0 ? Math.round(duration) : undefined;
@@ -180,7 +267,7 @@ export async function fetchLyrics({ artist, title, album, duration }) {
     duration: rounded,
   });
 
-  let record = await request(`/get?${exactQuery}`);
+  let record = await request(`/get?${exactQuery}`, { optional: true });
   if (record && editionClash(trackName, `${record.trackName || ""} ${record.albumName || ""}`)) record = null;
 
   if (!record && rounded) {
@@ -190,6 +277,7 @@ export async function fetchLyrics({ artist, title, album, duration }) {
         artist_name: artistName,
         album_name: album || undefined,
       })}`,
+      { optional: true },
     );
     if (record && editionClash(trackName, `${record.trackName || ""} ${record.albumName || ""}`)) record = null;
   }
@@ -202,6 +290,7 @@ export async function fetchLyrics({ artist, title, album, duration }) {
       })}`,
     );
     if (Array.isArray(results) && results.length) {
+      for (const item of results) rememberRecord(item);
       const best = [...results].sort(
         (a, b) => score(b, artistName, trackName, rounded || 0) - score(a, artistName, trackName, rounded || 0),
       )[0];
@@ -209,5 +298,6 @@ export async function fetchLyrics({ artist, title, album, duration }) {
     }
   }
 
+  if (record) rememberRecord(record);
   return outcome(record);
 }

@@ -19,6 +19,25 @@ function stampToSeconds(minutes, seconds, fraction) {
   return whole + Number(fraction) / 10 ** fraction.length;
 }
 
+function parseWords(raw, lineTime, offset) {
+  if (!/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/.test(raw)) return null;
+  const words = [];
+  const token = /<(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?>|([^\s<]+)/g;
+  let last = lineTime;
+  let match = token.exec(raw);
+  while (match) {
+    if (match[1] != null) last = stampToSeconds(match[1], match[2], match[3]) + offset;
+    else words.push({ t: last, text: match[4] });
+    match = token.exec(raw);
+  }
+  return words.length ? words : null;
+}
+
+function shiftWords(words, delta) {
+  if (!words?.length || !delta) return words;
+  return words.map((word) => ({ ...word, t: word.t + delta }));
+}
+
 export function parseLrc(source) {
   const lines = [];
   let offset = 0;
@@ -31,16 +50,25 @@ export function parseLrc(source) {
     }
 
     const stamps = [];
-    const text = raw
-      .replace(/\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g, (_, minutes, seconds, fraction) => {
-        stamps.push(stampToSeconds(minutes, seconds, fraction));
-        return "";
-      })
-      .replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, "")
-      .trim();
+    const marked = raw.replace(/\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g, (_, minutes, seconds, fraction) => {
+      stamps.push(stampToSeconds(minutes, seconds, fraction));
+      return "";
+    });
+    const text = marked.replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, "").replace(/\s+/g, " ").trim();
+    if (stamps.length === 0) continue;
+    const interlude = !text || /^(?:\.{2,}|…+|♪+|♫+|·+|-+|\(\s*instrumental\s*\)|instrumental)$/i.test(text);
 
-    if (!text || stamps.length === 0) continue;
-    for (const time of stamps) lines.push({ t: time + offset, text });
+    const first = stamps[0] + offset;
+    const words = interlude ? null : parseWords(marked, first, offset);
+    for (const time of stamps) {
+      const start = time + offset;
+      lines.push({
+        t: start,
+        text: interlude ? "♪♪" : text,
+        interlude,
+        words: words ? shiftWords(words, start - first) : undefined,
+      });
+    }
   }
 
   lines.sort((a, b) => a.t - b.t);

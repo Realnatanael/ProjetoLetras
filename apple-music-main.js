@@ -1,4 +1,7 @@
 (() => {
+  if (window.__projetoLetrasMain) return;
+  window.__projetoLetrasMain = true;
+
   const SOURCE = "projeto-letras";
   let lastSignature = "";
   let cachedMedia = null;

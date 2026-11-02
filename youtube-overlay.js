@@ -1,10 +1,33 @@
 (() => {
+  const generation = (window.__plOverlayGen = (window.__plOverlayGen || 0) + 1);
+  document.getElementById("projeto-letras-host")?.remove();
+
+  function alive() {
+    return window.__plOverlayGen === generation && Boolean(chrome.runtime?.id);
+  }
+
   const host = document.createElement("div");
   host.id = "projeto-letras-host";
   const shadow = host.attachShadow({ mode: "open" });
   const style = document.createElement("link");
   style.rel = "stylesheet";
-  style.href = chrome.runtime.getURL("overlay.css");
+  style.href = `${chrome.runtime.getURL("overlay.css")}?v=1.3.7`;
+  const karaokeStyle = document.createElement("style");
+  karaokeStyle.textContent = `
+    .pl-karaoke { display: inline; }
+    .pl-line.is-active { color: rgba(255,255,255,0.26); text-shadow: none !important; filter: none !important; }
+    .pl-ch { color: inherit; }
+    .pl-line.is-active .pl-ch { color: rgba(255,255,255,0.24) !important; text-shadow: none !important; }
+    .pl-line.is-active .pl-ch[data-state="on"] {
+      color: #fff !important;
+      text-shadow: 0 0 14px rgba(255,255,255,0.6), 0 0 2px #fff !important;
+    }
+    .pl-line.is-interlude { letter-spacing: 0.22em; }
+    .pl-line.is-interlude.is-active .pl-ch[data-state="on"] {
+      animation: pl-dots 1.7s ease-in-out infinite;
+    }
+    @keyframes pl-dots { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
+  `;
 
   const wrapper = document.createElement("div");
   wrapper.innerHTML = `
@@ -30,7 +53,8 @@
       </div>
     </div>
   `;
-  shadow.append(style, wrapper.firstElementChild);
+  shadow.append(style, wrapper.firstElementChild, karaokeStyle);
+  style.addEventListener("load", () => shadow.appendChild(karaokeStyle));
 
   const root = shadow.getElementById("pl-root");
   const stage = shadow.getElementById("pl-stage");
@@ -64,11 +88,54 @@
   let hudVisible = false;
   let hudTimer = 0;
   const hudEl = shadow.getElementById("pl-hud");
+  let sweepIndex = -1;
+  let sweepStart = 0;
+
+  const INTERLUDE_RE = /^(?:\.{2,}|…+|♪+|♫+|·+|-+|\(\s*instrumental\s*\)|instrumental)$/i;
+  const INTERLUDE_GAP = 3.2;
+
+  function isInterlude(line) {
+    return Boolean(line?.interlude) || INTERLUDE_RE.test(String(line?.text || "").trim());
+  }
+
+  function singDuration(text) {
+    const letters = Math.max(1, String(text || "").replace(/\s+/g, "").length);
+    return Math.min(6.2, Math.max(1.35, letters * 0.11));
+  }
+
+  function withInterludes(lines) {
+    if (!synced || !lines?.length) return lines;
+    const out = [];
+    const first = lines[0];
+    if (first && !isInterlude(first) && Number(first.t) >= 4) {
+      out.push({ t: 0, text: "♪♪", interlude: true });
+    }
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      out.push(line);
+      if (isInterlude(line)) continue;
+      const next = lines[i + 1];
+      if (next && isInterlude(next)) continue;
+      const start = Number(line.t) || 0;
+      const sung = start + singDuration(line.text);
+      const nextT = next
+        ? Number(next.t)
+        : Number(playback?.duration) || 0;
+      if (Number.isFinite(nextT) && nextT - sung >= INTERLUDE_GAP) {
+        out.push({ t: sung, text: "♪♪", interlude: true });
+      }
+    }
+    return out;
+  }
 
   function activeLines() {
-    if (mode === "translation" && lyrics.translation.length) return lyrics.translation;
-    if (lyrics.original.length) return lyrics.original;
-    return lyrics.translation;
+    const raw = mode === "translation" && lyrics.translation.length
+      ? lyrics.translation
+      : lyrics.original.length
+        ? lyrics.original
+        : lyrics.translation;
+    return withInterludes(raw);
   }
 
   function lineIndex(lines, time) {
@@ -111,20 +178,90 @@
     return Math.min(lines.length - 1, Math.floor(ratio * lines.length));
   }
 
+  function clamp01(value) {
+    return Math.max(0, Math.min(1, value));
+  }
+
+  function lineCursor(line, next, time, index, lines) {
+    if (index !== sweepIndex) {
+      sweepIndex = index;
+      sweepStart = time;
+    }
+
+    if (isInterlude(line)) return 1;
+
+    const dur = singDuration(line.text);
+    if (synced) {
+      const start = Number(line.t) || 0;
+      return clamp01((time - start) / dur);
+    }
+
+    const duration = Number(playback?.duration) || 0;
+    if (duration > 0 && lines.length) {
+      const start = (index / lines.length) * duration;
+      return clamp01((trackTime() - start) / dur);
+    }
+
+    return clamp01((time - sweepStart) / dur);
+  }
+
+  function fillKaraoke(container, text) {
+    container.replaceChildren();
+    for (const char of String(text || "")) {
+      const span = document.createElement("span");
+      if (/\s/.test(char)) {
+        span.className = "pl-space";
+        span.textContent = char;
+      } else {
+        span.className = "pl-ch";
+        span.dataset.state = "off";
+        span.textContent = char;
+      }
+      container.appendChild(span);
+    }
+  }
+
   function rebuild(lines) {
-    const signature = `${key}|${mode}|${synced ? "s" : "p"}|${lines.map((line) => `${line.t}|${line.text}`).join("\n")}`;
+    const signature = `k3|${key}|${mode}|${synced ? "s" : "p"}|${lines.map((line) => `${line.t}|${line.interlude ? "i" : ""}|${line.text}`).join("\n")}`;
     if (signature === builtKey) return false;
     builtKey = signature;
     activeIndex = -1;
+    sweepIndex = -1;
     linesEl.replaceChildren();
     for (const line of lines) {
       const paragraph = document.createElement("p");
       paragraph.className = "pl-line";
       paragraph.dataset.distance = "far";
-      paragraph.textContent = line.text;
+      if (isInterlude(line)) paragraph.classList.add("is-interlude");
+      const karaoke = document.createElement("span");
+      karaoke.className = "pl-karaoke";
+      fillKaraoke(karaoke, line.text);
+      paragraph.appendChild(karaoke);
       linesEl.appendChild(paragraph);
     }
     return true;
+  }
+
+  function resetKaraoke(node) {
+    if (!node || node.dataset.wipe === "idle") return;
+    node.dataset.wipe = "idle";
+    for (const letter of node.querySelectorAll(".pl-ch")) letter.dataset.state = "off";
+  }
+
+  function paintKaraoke(node, line, next, time, index, lines) {
+    if (!node || !line) return;
+    const letters = node.querySelectorAll(".pl-ch");
+    if (!letters.length) return;
+
+    const pos = lineCursor(line, next, time, index, lines) * letters.length;
+    const mark = String(Math.round(pos * 4) / 4);
+    if (node.dataset.wipe === mark) return;
+    node.dataset.wipe = mark;
+
+    for (let i = 0; i < letters.length; i += 1) {
+      const state = i < pos ? "on" : "off";
+      if (letters[i].dataset.state !== state) letters[i].dataset.state = state;
+    }
   }
 
   function targetFor(index) {
@@ -213,6 +350,7 @@
   }
 
   function paint() {
+    if (!alive()) return;
     const onWatch = location.pathname === "/watch";
     host.hidden = !onWatch;
     if (!onWatch) return;
@@ -246,7 +384,7 @@
       if (fetchStatus.state === "fetching") showHint(`Buscando letra de ${label}…`);
       else if (fetchStatus.state === "translating") showHint("Traduzindo a letra…");
       else if (fetchStatus.state === "missing" || fetchStatus.state === "instrumental") {
-        showHint(fetchStatus.detail || `LRCLIB não encontrou letra para ${label}.`);
+        showHint(fetchStatus.detail || `Não encontrei letra para ${label}.`);
       } else if (fetchStatus.state === "error") {
         showHint(fetchStatus.detail || "Falha ao buscar a letra.");
       } else {
@@ -268,7 +406,13 @@
 
     const index = synced ? Math.max(0, lineIndex(lines, time)) : plainIndex(lines);
     const changed = index !== activeIndex;
-    updateLineStates(index, subtitle(time, index), changed);
+    updateLineStates(index, isInterlude(lines[index]) ? "" : subtitle(time, index), changed);
+    if (!hidden) {
+      paintKaraoke(linesEl.children[index], lines[index], lines[index + 1], time, index, lines);
+    }
+    if (changed && activeIndex >= 0 && linesEl.children[activeIndex] && activeIndex !== index) {
+      resetKaraoke(linesEl.children[activeIndex]);
+    }
 
     if (rebuilt) {
       activeIndex = index;
@@ -295,6 +439,7 @@
   }
 
   function place() {
+    if (!alive()) return;
     const parent = fullscreenHost();
     if (placedParent === parent && host.isConnected) return;
     parent.appendChild(host);
@@ -360,7 +505,7 @@
       return;
     }
     if (!list.length || list.every((item) => item.current)) {
-      optionsEl.textContent = "A LRCLIB não tem outra versão parecida.";
+      optionsEl.textContent = "Não achei outra versão parecida.";
       return;
     }
 
@@ -412,7 +557,7 @@
       const response = await chrome.runtime.sendMessage({ type: "list-candidates" });
       renderCandidates(response?.candidates || [], response?.ok === false ? response.error : "");
     } catch {
-      renderCandidates([], "Não consegui consultar a LRCLIB.");
+      renderCandidates([], "Não consegui consultar outras versões.");
     }
   }
 
@@ -427,7 +572,7 @@
   }, true);
 
   function onMouseMove(event) {
-    if (host.hidden) return;
+    if (!alive() || host.hidden) return;
     if (event.clientY <= 88) showHud();
     else if (!hudEl.matches(":hover")) hideHudSoon();
   }
@@ -455,10 +600,15 @@
   }
 
   function connect() {
+    if (!alive()) return;
     try {
       const port = chrome.runtime.connect({ name: "overlay" });
-      port.onMessage.addListener(applyState);
-      port.onDisconnect.addListener(() => window.setTimeout(connect, 400));
+      port.onMessage.addListener((message) => {
+        if (alive()) applyState(message);
+      });
+      port.onDisconnect.addListener(() => {
+        if (alive()) window.setTimeout(connect, 400);
+      });
     } catch {
       window.setTimeout(connect, 1000);
     }
@@ -479,6 +629,7 @@
   });
 
   function tick() {
+    if (!alive()) return;
     paint();
     window.requestAnimationFrame(tick);
   }

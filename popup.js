@@ -14,6 +14,7 @@ const statusTitle = document.querySelector("#status");
 const clock = document.querySelector("#clock");
 const songs = document.querySelector("#songs");
 const help = document.querySelector("#help");
+const attachButton = document.querySelector("#attach");
 
 let importing = "original";
 let state = null;
@@ -171,6 +172,7 @@ function renderSongs(list) {
     if (item.translation) parts.push(`${item.translation} traduzidas`);
     if (item.status === "plain") parts.push("sem sincronia");
     if (item.source === "lrclib") parts.push("LRCLIB");
+    if (item.source === "lrcmux") parts.push("reserva");
     if (item.source === "manual") parts.push("manual");
     meta.textContent = parts.join(" · ");
     text.append(name, meta);
@@ -194,25 +196,49 @@ function renderSongs(list) {
 function renderFetchStatus(status) {
   const map = {
     idle: "",
-    fetching: "Buscando letra na LRCLIB…",
+    fetching: "Buscando letra…",
     translating: "Traduzindo para português…",
     found: status?.detail || "Letra pronta.",
-    missing: status?.detail || "LRCLIB não encontrou essa letra.",
+    missing: status?.detail || "Não encontrei essa letra.",
     instrumental: status?.detail || "Faixa instrumental.",
     error: status?.detail || "Falha na busca.",
   };
   fetchDetail.textContent = map[status?.state] || status?.detail || "";
 }
 
-async function refresh() {
-  state = await chrome.runtime.sendMessage({ type: "get-state" });
-  if (!state) return;
+let autoAttachTried = false;
+let attaching = false;
+
+async function reconnect() {
+  if (attaching) return;
+  attaching = true;
+  if (attachButton) attachButton.disabled = true;
+  try {
+    await chrome.runtime.sendMessage({ type: "attach" });
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
+    state = await chrome.runtime.sendMessage({ type: "get-state" });
+  } catch {
+    // o service worker pode estar acordando
+  } finally {
+    attaching = false;
+    if (attachButton) attachButton.disabled = false;
+  }
+}
+
+attachButton?.addEventListener("click", async () => {
+  await reconnect();
+  if (state) renderState(state);
+});
+
+function renderState(next) {
+  state = next;
   const playback = state.playback;
   const fresh = playbackFresh(playback);
+  if (attachButton) attachButton.hidden = fresh;
 
   if (!fresh) {
     statusTitle.textContent = "Apple Music não detectado";
-    clock.textContent = "Abra music.apple.com e dê play.";
+    clock.textContent = "Abra music.apple.com e dê play. Se a aba já estiver aberta, reconecte.";
   } else {
     statusTitle.textContent = playback.title;
     const duration = playback.duration ? ` / ${format(playback.duration)}` : "";
@@ -228,6 +254,21 @@ async function refresh() {
   if (document.activeElement !== autoTranslateInput) autoTranslateInput.checked = state.autoTranslate !== false;
   renderFetchStatus(state.fetchStatus);
   renderSongs(state.songs || []);
+}
+
+async function refresh() {
+  try {
+    state = await chrome.runtime.sendMessage({ type: "get-state" });
+  } catch {
+    return;
+  }
+  if (!state) return;
+
+  if (!playbackFresh(state.playback) && !autoAttachTried) {
+    autoAttachTried = true;
+    await reconnect();
+  }
+  if (state) renderState(state);
 }
 
 function playbackFresh(playback) {

@@ -5,6 +5,7 @@ import { translateTimedLines } from "./translate.js";
 const MODES = new Set(["original", "translation", "both"]);
 const MISS_TTL = 1000 * 60 * 60 * 12;
 const TRANSLATE_RETRY_MS = 1000 * 60 * 10;
+const FETCH_ERROR_MS = 15 * 1000;
 const defaults = () => ({
   songs: {},
   offsets: {},
@@ -23,6 +24,7 @@ const ports = new Set();
 const playbackPorts = new Set();
 const inflight = new Map();
 let pingTimer = 0;
+let fetchErrorAt = 0;
 
 const ready = chrome.storage.local.get("library").then((stored) => {
   library = sanitize(stored.library);
@@ -76,7 +78,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         sendResponse({ ok: true, candidates: await listCandidates() });
       } catch (error) {
-        sendResponse({ ok: false, error: error.message || "Não consegui consultar a LRCLIB.", candidates: [] });
+        sendResponse({ ok: false, error: error.message || "Não consegui consultar outras versões.", candidates: [] });
       }
     });
     return true;
@@ -92,6 +94,63 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+
+  if (message?.type === "attach") {
+    void attachOpenTabs().then((result) => sendResponse(result));
+    return true;
+  }
+});
+
+let attaching = null;
+
+async function inject(tabId, files, world, allFrames) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: Boolean(allFrames) },
+      files,
+      world,
+    });
+  } catch {
+    // aba fechada, restrita ou ainda carregando
+  }
+}
+
+async function attachTab(tab) {
+  if (!tab?.id || tab.discarded || !tab.url) return;
+  if (tab.url.startsWith("https://music.apple.com/")) {
+    await inject(tab.id, ["apple-music-bridge.js"], "ISOLATED", true);
+    await inject(tab.id, ["apple-music-main.js"], "MAIN", true);
+    return;
+  }
+  if (tab.url.startsWith("https://www.youtube.com/")) {
+    await inject(tab.id, ["youtube-overlay.js"], "ISOLATED", false);
+  }
+}
+
+async function attachOpenTabs() {
+  if (!chrome.scripting?.executeScript) return { ok: false, tabs: 0 };
+  if (attaching) return attaching;
+  attaching = (async () => {
+    try {
+      const tabs = await chrome.tabs.query({
+        url: ["https://music.apple.com/*", "https://www.youtube.com/*"],
+      });
+      await Promise.all(tabs.map((tab) => attachTab(tab)));
+      return { ok: true, tabs: tabs.length };
+    } catch (error) {
+      return { ok: false, tabs: 0, error: error.message };
+    } finally {
+      attaching = null;
+    }
+  })();
+  return attaching;
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  void attachOpenTabs();
+});
+chrome.runtime.onStartup.addListener(() => {
+  void attachOpenTabs();
 });
 
 chrome.runtime.onConnect.addListener((port) => {
@@ -264,7 +323,7 @@ function rememberLyrics(key, result, picked) {
     artist: playback?.artist || previous.artist || "",
     title: playback?.title || previous.title || "",
     album: playback?.album || previous.album || "",
-    source: "lrclib",
+    source: result.provider === "lrcmux" ? "lrcmux" : "lrclib",
     status: result.status,
     synced: Boolean(result.synced),
     lrclibId: Number(result.record?.id) || 0,
@@ -343,7 +402,7 @@ async function fetchSong(key, force) {
 
   try {
     if (wantOriginal) {
-      setFetchStatus(key, "fetching", "Buscando letra na LRCLIB…");
+      setFetchStatus(key, "fetching", "Buscando letra…");
       const result = await fetchLyrics({
         artist: playback.artist,
         title: playback.title,
@@ -353,11 +412,12 @@ async function fetchSong(key, force) {
       const failed = result.status === "missing" || result.status === "instrumental" || result.status === "invalid";
       rememberLyrics(key, result, false);
       await persist();
+      fetchErrorAt = 0;
       if (failed) {
         setFetchStatus(
           key,
           result.status,
-          result.status === "instrumental" ? "Faixa instrumental." : "LRCLIB não encontrou essa letra.",
+          result.status === "instrumental" ? "Faixa instrumental." : "Não encontrei essa letra.",
         );
         return view();
       }
@@ -365,8 +425,10 @@ async function fetchSong(key, force) {
     }
 
     await fillTranslation(key);
+    fetchErrorAt = 0;
     return view();
   } catch (error) {
+    fetchErrorAt = Date.now();
     setFetchStatus(key, "error", error.message || "Falha ao buscar a letra.");
     return view();
   }
@@ -377,6 +439,7 @@ async function maybeFetch({ force = false } = {}) {
   const key = currentKey();
   if (!key || !playback?.title) return null;
   if (!force && !library.autoFetch) return null;
+  if (!force && fetchErrorAt && Date.now() - fetchErrorAt < FETCH_ERROR_MS) return null;
 
   const song = library.songs[key];
   if (!force && !needsOriginal(song) && !needsTranslation(song)) return null;

@@ -37,6 +37,11 @@ h1 {
   font-size: 13px;
 }
 
+#attach {
+  margin-top: 10px;
+  width: 100%;
+}
+
 .card,
 #songs,
 #help {
